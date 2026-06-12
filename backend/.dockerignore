@@ -1,0 +1,57 @@
+# =============================================================================
+# .dockerignore — files excluded from the Docker build context
+#
+# Keeping the build context small speeds up `docker build` and prevents
+# secrets / local state from leaking into the image.
+# =============================================================================
+
+# ── Python artifacts ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Local data — NEVER bake state into the image ─────────────────────────────
+studysync.db
+*.db
+*.db-shm
+*.db-wal
+s3_store/
+uploads/
+
+# ── Secrets and config ────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Development / IDE ────────────────────────────────────────────────────────
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Docs and CI ──────────────────────────────────────────────────────────────
+docs/
+*.md
+!README.md
+tests/

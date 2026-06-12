@@ -1,0 +1,2 @@
+[console_scripts]
+study = studysync.main:app

@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# ---------------------------------------------------------------------------
+# Core metadata
+# ---------------------------------------------------------------------------
+[project]
+name = "study_sync"
+version = "1.0.3"
+description = "Offline-first, distributed workspace synchronisation CLI for developers."
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Adinath", email = "adinarayan.is23@bmsce.ac.in" },
+]
+keywords = [
+    "sync", "cli", "workspace", "distributed",
+    "version-control", "developer-tools",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Filesystems",
+    "Topic :: Utilities",
+]
+
+# ---------------------------------------------------------------------------
+# Runtime dependencies
+# ---------------------------------------------------------------------------
+dependencies = [
+    "typer[all]>=0.12.0",
+    "rich>=13.7.0",
+    "requests>=2.31.0",
+]
+
+# ---------------------------------------------------------------------------
+# Optional extras
+#   pip install studysync[dev]
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.14.0",
+    "responses>=0.25.0",
+    "build>=1.2.0",
+    "twine>=5.0.0",
+]
+
+# ---------------------------------------------------------------------------
+# Entry point — makes `study` work as a global shell command
+# ---------------------------------------------------------------------------
+[project.scripts]
+study = "studysync.main:app"
+
+# ---------------------------------------------------------------------------
+# Project URLs shown on the PyPI landing page
+# ---------------------------------------------------------------------------
+[project.urls]
+Homepage      = "https://github.com/yourusername/studysync"
+Documentation = "https://github.com/yourusername/studysync#readme"
+"Bug Tracker" = "https://github.com/yourusername/studysync/issues"
+Changelog     = "https://github.com/yourusername/studysync/releases"
+
+# ---------------------------------------------------------------------------
+# Package discovery
+# ---------------------------------------------------------------------------
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["studysync*"]
+
+[tool.setuptools.package-data]
+studysync = ["py.typed"]

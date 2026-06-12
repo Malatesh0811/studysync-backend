@@ -1,0 +1,33 @@
+Metadata-Version: 2.4
+Name: study_sync
+Version: 1.0.3
+Summary: Offline-first, distributed workspace synchronisation CLI for developers.
+Author-email: Adinath <adinarayan.is23@bmsce.ac.in>
+License: MIT
+Project-URL: Homepage, https://github.com/yourusername/studysync
+Project-URL: Documentation, https://github.com/yourusername/studysync#readme
+Project-URL: Bug Tracker, https://github.com/yourusername/studysync/issues
+Project-URL: Changelog, https://github.com/yourusername/studysync/releases
+Keywords: sync,cli,workspace,distributed,version-control,developer-tools
+Classifier: Development Status :: 4 - Beta
+Classifier: Environment :: Console
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Classifier: Topic :: System :: Filesystems
+Classifier: Topic :: Utilities
+Requires-Python: >=3.10
+Requires-Dist: typer[all]>=0.12.0
+Requires-Dist: rich>=13.7.0
+Requires-Dist: requests>=2.31.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: pytest-mock>=3.14.0; extra == "dev"
+Requires-Dist: responses>=0.25.0; extra == "dev"
+Requires-Dist: build>=1.2.0; extra == "dev"
+Requires-Dist: twine>=5.0.0; extra == "dev"
