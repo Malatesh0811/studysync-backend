@@ -11,12 +11,48 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
 from database import Base
+
+
+# ---------------------------------------------------------------------------
+# SQLite-compatible UUID column type
+# ---------------------------------------------------------------------------
+
+class GUID(TypeDecorator):
+    """
+    Platform-independent UUID type.
+
+    Uses PostgreSQL's native UUID type when available; stores as a 36-char
+    VARCHAR string on SQLite (and other databases).  Values are always
+    returned as Python ``uuid.UUID`` objects when ``as_uuid=True`` is the
+    intent, but here we store/return plain strings to keep things simple
+    and avoid any dialect dependency.
+    """
+
+    impl = String(36)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, uuid.UUID):
+            return str(value)
+        return str(uuid.UUID(str(value)))
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return str(value)   # return as string; callers wrap in str() anyway
+
+
+def _new_uuid() -> str:
+    return str(uuid.uuid4())
+
 
 
 def _utcnow() -> datetime:
@@ -35,12 +71,12 @@ class Workspace(Base):
 
     __tablename__ = "workspaces"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=_new_uuid)
     name = Column(String(255), nullable=False, unique=True, index=True)
     access_token = Column(
-        UUID(as_uuid=True),
+        GUID(),
         nullable=False,
-        default=uuid.uuid4,
+        default=_new_uuid,
         unique=True,
         index=True,
     )
@@ -87,9 +123,9 @@ class File(Base):
         UniqueConstraint("workspace_id", "file_path", name="uq_workspace_file_path"),
     )
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=_new_uuid)
     workspace_id = Column(
-        UUID(as_uuid=True),
+        GUID(),
         ForeignKey("workspaces.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
@@ -123,9 +159,9 @@ class FileVersion(Base):
 
     __tablename__ = "file_versions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=_new_uuid)
     file_id = Column(
-        UUID(as_uuid=True),
+        GUID(),
         ForeignKey("files.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
@@ -159,9 +195,9 @@ class PendingUpload(Base):
 
     __tablename__ = "pending_uploads"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=_new_uuid)
     workspace_id = Column(
-        UUID(as_uuid=True),
+        GUID(),
         ForeignKey("workspaces.id", ondelete="CASCADE"),
         nullable=False,
     )
@@ -195,10 +231,10 @@ class Alias(Base):
 
     __tablename__ = "aliases"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=_new_uuid)
     alias_name = Column(String(255), nullable=False, unique=True, index=True)
     workspace_id = Column(
-        UUID(as_uuid=True),
+        GUID(),
         ForeignKey("workspaces.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
