@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from database import Base, engine, get_db
-from models import File, FileVersion, PendingUpload, Workspace
+from models import Alias, File, FileVersion, PendingUpload, Workspace
 from s3_service import S3Service
 
 # ---------------------------------------------------------------------------
@@ -139,6 +139,11 @@ def create_workspace(
 
     workspace = Workspace(name=body.name)
     db.add(workspace)
+    db.flush()   # get workspace.id before committing
+
+    # Register the workspace name as its canonical alias
+    alias_row = Alias(alias_name=body.name, workspace_id=workspace.id)
+    db.add(alias_row)
     db.commit()
     db.refresh(workspace)
 
@@ -515,6 +520,80 @@ def request_download(
         presigned_url=presigned_url,
         expires_in_seconds=s3.expiry,
     )
+
+
+# ---------------------------------------------------------------------------
+# Alias / token resolution  — GET /resolve/{input}
+# ---------------------------------------------------------------------------
+
+
+@app.get("/resolve/{input_str}", tags=["workspaces"])
+def resolve_workspace(input_str: str, db: Session = Depends(get_db)) -> dict:
+    """
+    Resolve *input_str* to a workspace token, checking the Aliases table first.
+
+    Algorithm
+    ---------
+    1. Look up ``input_str`` in the ``aliases`` table.
+       If found → return the workspace's token with ``resolved_from_alias=True``.
+    2. If not in aliases, try ``input_str`` as a raw UUID access_token.
+       If found → return with ``resolved_from_alias=False``.
+    3. Otherwise → HTTP 404.
+
+    Response shape
+    --------------
+    .. code-block:: json
+
+        {
+            "resolved_from_alias": true,
+            "alias": "my-project",
+            "workspace_id": "<uuid>",
+            "name": "my-project",
+            "access_token": "<uuid>"
+        }
+    """
+    # 1. Alias lookup
+    alias_row = db.query(Alias).filter(Alias.alias_name == input_str).first()
+    if alias_row:
+        ws = db.query(Workspace).filter(Workspace.id == alias_row.workspace_id).first()
+        if ws is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Alias points to a deleted workspace.",
+            )
+        return {
+            "resolved_from_alias": True,
+            "alias": input_str,
+            "workspace_id": str(ws.id),
+            "name": ws.name,
+            "access_token": str(ws.access_token),
+        }
+
+    # 2. Raw UUID (access_token) lookup
+    try:
+        token_uuid = uuid.UUID(input_str)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"'{input_str}' is neither a known alias nor a valid UUID token. "
+                "Check the value and try again."
+            ),
+        )
+
+    ws = db.query(Workspace).filter(Workspace.access_token == token_uuid).first()
+    if ws is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No workspace found for token '{input_str}'.",
+        )
+    return {
+        "resolved_from_alias": False,
+        "alias": None,
+        "workspace_id": str(ws.id),
+        "name": ws.name,
+        "access_token": str(ws.access_token),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -59,6 +59,13 @@ class Workspace(Base):
         cascade="all, delete-orphan",
         lazy="dynamic",
     )
+    aliases = relationship(
+        "Alias",
+        back_populates="workspace",
+        cascade="all, delete-orphan",
+        lazy="dynamic",
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -168,3 +175,36 @@ class PendingUpload(Base):
 
     # relationships
     workspace = relationship("Workspace", back_populates="pending_uploads")
+
+
+# ---------------------------------------------------------------------------
+# aliases  (workspace name → UUID mapping)
+# ---------------------------------------------------------------------------
+
+class Alias(Base):
+    """
+    Maps a human-readable alias (workspace name) to a workspace UUID.
+
+    An alias row is written automatically when a workspace is created, using
+    the workspace name as the alias.  This lets users join with:
+
+        study join my-project
+
+    instead of a raw UUID token.  Additional aliases can be inserted manually.
+    """
+
+    __tablename__ = "aliases"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    alias_name = Column(String(255), nullable=False, unique=True, index=True)
+    workspace_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    # relationships
+    workspace = relationship("Workspace", back_populates="aliases")
+
