@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -23,11 +24,14 @@ from rich.table import Table
 
 from .constants import PRODUCTION_SERVER_URL
 from .local_state import (
+    add_to_outbox,
     all_local_files,
     ensure_dirs,
     load_config,
     load_manifest,
+    load_outbox,
     local_file_path,
+    save_outbox,
     sha256_file,
     update_manifest_entry,
     workspace_root,
@@ -78,7 +82,7 @@ class SyncEngine:
         self.session.headers["User-Agent"] = "studysync-cli/1.0"
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Low-level request helpers
     # ------------------------------------------------------------------
 
     def _raise_for_status(self, resp: requests.Response) -> None:
@@ -91,19 +95,47 @@ class SyncEngine:
         raise HTTPError("HTTP " + str(resp.status_code) + ": " + str(detail), response=resp)
 
     def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        """
+        Send a request.
+
+        ReadTimeout  → server is cold-starting on Render; retry up to 3 times
+                       with increasing waits so the user never sees a failure
+                       just because the server was idle.
+        ConnectionError → user is offline; raise immediately so the caller can
+                          stage the operation locally without waiting.
+        """
         kwargs.setdefault("timeout", 90)
-        try:
-            return self.session.request(method, url, **kwargs)
-        except requests.ReadTimeout:
-            console.print("[yellow]Server is waking up (cold start) -- retrying...[/yellow]")
-            kwargs["timeout"] = 120
-            return self.session.request(method, url, **kwargs)
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self.session.request(method, url, **kwargs)
+            except requests.ReadTimeout:
+                if attempt == max_attempts:
+                    raise
+                wait = attempt * 15
+                console.print(
+                    "[yellow]Server is waking up (cold start), retrying in "
+                    + str(wait) + "s (attempt "
+                    + str(attempt) + "/" + str(max_attempts - 1) + ")...[/yellow]"
+                )
+                time.sleep(wait)
+                kwargs["timeout"] = 120
+            # ConnectionError is NOT retried — propagates immediately so offline
+            # staging kicks in without any delay.
 
     def _get(self, url: str, **kwargs: Any) -> requests.Response:
         return self._request("GET", url, **kwargs)
 
     def _post(self, url: str, **kwargs: Any) -> requests.Response:
         return self._request("POST", url, **kwargs)
+
+    def _is_online(self) -> bool:
+        """Quick 5-second reachability check. Used before flushing the outbox."""
+        try:
+            self.session.get(self.base_url + "/health", timeout=5)
+            return True
+        except (requests.ConnectionError, requests.Timeout):
+            return False
 
     def _require_workspace(self) -> None:
         if not self.workspace_id or not self.token:
@@ -118,6 +150,122 @@ class SyncEngine:
                 )
             )
             sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Outbox flush  (replay offline pushes when back online)
+    # ------------------------------------------------------------------
+
+    def _flush_outbox(self) -> None:
+        """
+        Silently replay any pushes that were staged while offline.
+        Called at the start of push / pull / status.
+        Skipped instantly if offline or outbox is empty.
+        """
+        outbox = load_outbox()
+        if not outbox:
+            return
+        if not self._is_online():
+            return
+
+        console.print(
+            "[dim]Syncing " + str(len(outbox)) + " pending push(es) from outbox...[/dim]"
+        )
+
+        still_offline = False
+        to_keep = []
+
+        for entry in outbox:
+            if still_offline:
+                to_keep.append(entry)
+                continue
+
+            file_path = entry["file_path"]
+            checksum = entry["checksum"]
+            base_version = entry["base_version"]
+            vault_path = Path(entry["vault_path"])
+            size = entry.get("size_bytes", 0)
+
+            if not vault_path.exists():
+                console.print(
+                    "[yellow]Outbox: vault file for '" + file_path + "' is missing — skipped.[/yellow]"
+                )
+                continue
+
+            # --- upload-request ---
+            try:
+                req = self._post(
+                    self.base_url + "/sync/upload-request",
+                    json={
+                        "workspace_token": self.token,
+                        "file_path": file_path,
+                        "checksum": checksum,
+                        "size_bytes": size,
+                        "base_version": base_version,
+                    },
+                )
+            except requests.ConnectionError:
+                still_offline = True
+                to_keep.append(entry)
+                continue
+            except requests.ReadTimeout:
+                to_keep.append(entry)
+                continue
+
+            if req.status_code == 409:
+                console.print(
+                    "[yellow]⚠ '" + file_path + "' was updated on the server while you were offline.\n"
+                    "  Run [cyan]study pull[/cyan] then [cyan]study push "
+                    + file_path + "[/cyan] to resolve.[/yellow]"
+                )
+                to_keep.append(entry)
+                continue
+
+            try:
+                self._raise_for_status(req)
+            except HTTPError as exc:
+                console.print("[red]Outbox flush error for '" + file_path + "': " + str(exc) + "[/red]")
+                to_keep.append(entry)
+                continue
+
+            data = req.json()
+            presigned_url = data["presigned_url"]
+            upload_id = data["upload_id"]
+            new_version = data["new_version"]
+
+            # --- PUT bytes to presigned URL ---
+            try:
+                with open(vault_path, "rb") as fh:
+                    put_resp = self.session.put(
+                        presigned_url,
+                        data=fh,
+                        headers={
+                            "Content-Length": str(size),
+                            "Content-Type": "application/octet-stream",
+                        },
+                        timeout=300,
+                    )
+                    put_resp.raise_for_status()
+            except Exception as exc:
+                console.print("[red]Outbox upload failed for '" + file_path + "': " + str(exc) + "[/red]")
+                to_keep.append(entry)
+                continue
+
+            # --- commit ---
+            try:
+                commit = self._post(
+                    self.base_url + "/sync/commit-upload",
+                    json={"upload_id": upload_id},
+                )
+                self._raise_for_status(commit)
+            except Exception as exc:
+                console.print("[red]Outbox commit failed for '" + file_path + "': " + str(exc) + "[/red]")
+                to_keep.append(entry)
+                continue
+
+            update_manifest_entry(file_path, new_version, checksum, pending=False)
+            console.print("[green]✓ Synced '" + file_path + "' → v" + str(new_version) + "[/green]")
+
+        save_outbox(to_keep)
 
     # ------------------------------------------------------------------
     # Workspace management
@@ -170,13 +318,14 @@ class SyncEngine:
 
     def pull(self) -> None:
         self._require_workspace()
+        self._flush_outbox()
         cwd = Path(os.getcwd())
 
         with console.status("[blue]Fetching workspace state...[/blue]", spinner="dots"):
             try:
                 resp = self._get(self.base_url + "/sync/state/" + self.token)
                 self._raise_for_status(resp)
-            except (HTTPError, requests.ConnectionError) as exc:
+            except (HTTPError, requests.ConnectionError, requests.Timeout) as exc:
                 console.print(Panel(str(exc), title="[bold red]Pull failed[/bold red]",
                                     border_style="red", padding=(1, 2)))
                 sys.exit(1)
@@ -184,7 +333,7 @@ class SyncEngine:
         remote_files = {f["file_path"]: f for f in resp.json().get("files", [])}
 
         if not remote_files:
-            console.print("[green]Workspace is empty -- nothing to pull.[/green]")
+            console.print("[green]Workspace is empty — nothing to pull.[/green]")
             return
 
         manifest = load_manifest()
@@ -228,7 +377,7 @@ class SyncEngine:
                         params={"workspace_token": self.token, "file_path": fp},
                     )
                     self._raise_for_status(dl)
-                except (HTTPError, requests.ConnectionError) as exc:
+                except (HTTPError, requests.ConnectionError, requests.Timeout) as exc:
                     errors.append(fp + ": " + str(exc))
                     progress.update(task_id, visible=False)
                     continue
@@ -269,7 +418,7 @@ class SyncEngine:
                 console.print("[red]Failed: " + e + "[/red]")
         ok = len(to_download) - len(errors)
         console.print(
-            "[green]Pull complete -- " + str(ok) + "/" + str(len(to_download))
+            "[green]Pull complete — " + str(ok) + "/" + str(len(to_download))
             + " file(s) written to " + str(cwd) + "[/green]"
         )
 
@@ -279,6 +428,7 @@ class SyncEngine:
 
     def push(self, file_path_arg: str) -> None:
         self._require_workspace()
+        self._flush_outbox()
 
         src = Path(file_path_arg).expanduser().resolve()
         if not src.exists():
@@ -294,14 +444,18 @@ class SyncEngine:
         manifest = load_manifest()
         local_entry = manifest.get(file_path, {})
 
-        if local_entry.get("checksum") == checksum:
-            console.print("[yellow]No changes detected in '" + file_path + "' -- nothing to push.[/yellow]")
+        # Skip only if checksum matches AND there is no pending offline push
+        if local_entry.get("checksum") == checksum and not local_entry.get("pending"):
+            console.print(
+                "[yellow]No changes detected in '" + file_path + "' — nothing to push.[/yellow]"
+            )
             return
 
         base_version = local_entry.get("version", 0)
 
-        with console.status("[blue]Requesting upload slot...[/blue]", spinner="dots"):
-            try:
+        # --- attempt online push ---
+        try:
+            with console.status("[blue]Requesting upload slot...[/blue]", spinner="dots"):
                 req = self._post(
                     self.base_url + "/sync/upload-request",
                     json={
@@ -324,7 +478,7 @@ class SyncEngine:
                             "Your local base version: " + str(base_version) + "\n\n"
                             "Run [cyan]study pull[/cyan] first, then push again.\n\n"
                             + str(detail),
-                            title="[bold red]Conflict -- pull required[/bold red]",
+                            title="[bold red]Conflict — pull required[/bold red]",
                             border_style="red",
                             padding=(1, 2),
                         )
@@ -333,10 +487,23 @@ class SyncEngine:
 
                 self._raise_for_status(req)
 
-            except HTTPError as exc:
-                console.print(Panel(str(exc), title="[bold red]Upload request failed[/bold red]",
-                                    border_style="red", padding=(1, 2)))
-                sys.exit(1)
+        except requests.ConnectionError:
+            # --- OFFLINE: stage locally ---
+            vault_path = local_file_path(self.workspace_name, file_path)
+            vault_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, vault_path)
+            update_manifest_entry(file_path, base_version, checksum, pending=True)
+            add_to_outbox(file_path, checksum, base_version, str(vault_path), size)
+            console.print(
+                "[green]✓ '" + file_path + "' saved locally.[/green] "
+                "[dim]Will sync to server automatically when back online.[/dim]"
+            )
+            return
+
+        except (HTTPError, requests.ReadTimeout) as exc:
+            console.print(Panel(str(exc), title="[bold red]Upload request failed[/bold red]",
+                                border_style="red", padding=(1, 2)))
+            sys.exit(1)
 
         data = req.json()
         presigned_url = data["presigned_url"]
@@ -353,31 +520,30 @@ class SyncEngine:
             transient=True,
         ) as progress:
             task_id = progress.add_task("Uploading " + file_path, total=size)
-            with open(src, "rb") as fh:
-                reader = _ProgressReader(src, task_id, progress)
-                put_resp = self.session.put(
-                    presigned_url,
-                    data=reader,
-                    headers={
-                        "Content-Length": str(size),
-                        "Content-Type": "application/octet-stream",
-                    },
-                    timeout=300,
-                )
-                put_resp.raise_for_status()
+            reader = _ProgressReader(src, task_id, progress)
+            put_resp = self.session.put(
+                presigned_url,
+                data=reader,
+                headers={
+                    "Content-Length": str(size),
+                    "Content-Type": "application/octet-stream",
+                },
+                timeout=300,
+            )
+            put_resp.raise_for_status()
 
         with console.status("[blue]Committing...[/blue]", spinner="dots"):
             try:
                 commit = self._post(self.base_url + "/sync/commit-upload",
                                     json={"upload_id": upload_id})
                 self._raise_for_status(commit)
-            except (HTTPError, requests.ConnectionError) as exc:
+            except (HTTPError, requests.ConnectionError, requests.Timeout) as exc:
                 console.print(Panel(str(exc), title="[bold red]Commit failed[/bold red]",
                                     border_style="red", padding=(1, 2)))
                 sys.exit(1)
 
         update_manifest_entry(file_path, new_version, checksum)
-        console.print("[green]Pushed '" + file_path + "' -> v" + str(new_version) + "[/green]")
+        console.print("[green]Pushed '" + file_path + "' → v" + str(new_version) + "[/green]")
 
     # ------------------------------------------------------------------
     # status
@@ -385,15 +551,23 @@ class SyncEngine:
 
     def status(self) -> None:
         self._require_workspace()
+        self._flush_outbox()
         cwd = Path(os.getcwd())
 
+        server_reachable = True
         with console.status("[blue]Fetching server state...[/blue]", spinner="dots"):
             try:
                 resp = self._get(self.base_url + "/sync/state/" + self.token)
                 self._raise_for_status(resp)
                 remote_files = {f["file_path"]: f for f in resp.json().get("files", [])}
-            except (HTTPError, requests.ConnectionError):
+            except (HTTPError, requests.ConnectionError, requests.Timeout):
                 remote_files = {}
+                server_reachable = False
+
+        if not server_reachable:
+            console.print(
+                "[yellow]⚠ Could not reach server — showing local state only.[/yellow]"
+            )
 
         manifest = load_manifest()
 
@@ -407,7 +581,9 @@ class SyncEngine:
                     pass
 
         if not all_paths:
-            console.print("[yellow]No files tracked. Run [cyan]study push <file>[/cyan] to start.[/yellow]")
+            console.print(
+                "[yellow]No files tracked. Run [cyan]study push <file>[/cyan] to start.[/yellow]"
+            )
             return
 
         table = Table(show_header=True, header_style="bold blue")
@@ -424,7 +600,10 @@ class SyncEngine:
             server_ver = str(remote_info.get("latest_version", "-")) if remote_info else "-"
             local_cksum = local_entry.get("checksum", "") if local_entry else ""
 
-            if remote_info and not file_on_disk and not local_entry:
+            # Pending offline push takes priority
+            if local_entry.get("pending"):
+                status_cell = "[magenta]PENDING PUSH[/magenta]"
+            elif remote_info and not file_on_disk and not local_entry:
                 status_cell = "[cyan]NOT PULLED[/cyan]"
             elif remote_info and not file_on_disk and local_entry:
                 status_cell = "[red]MISSING[/red]"

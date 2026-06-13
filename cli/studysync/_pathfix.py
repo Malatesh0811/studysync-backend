@@ -1,13 +1,21 @@
 """
-Auto-fix for the `study` command not being on PATH after pip install.
+Auto-fix for `study` not being on PATH after pip install.
 
-Strategy
---------
-1. Write study.bat into the directory that already contains python.exe
-   (that dir is on PATH by definition, so the bat works *immediately*
-   in the current terminal - no restart needed).
-2. Also add the Scripts dir to the user's registry PATH so future
-   terminals find the native study.exe directly.
+What we do
+----------
+1. Write study.bat to %LOCALAPPDATA%\Microsoft\WindowsApps\ — this directory
+   is on the default PATH of every Windows 10/11 machine, so the bat works
+   in every NEW terminal with zero user action.
+2. Also write to the directory containing python.exe and any other writable
+   user-space PATH directory as fallbacks.
+3. Add the Python Scripts dir to the registry PATH for native study.exe.
+
+Limitation
+----------
+cmd.exe reads PATH once at startup. No Python code can update an already-running
+cmd.exe. So in the SAME terminal where pip was run, use:
+    python -m studysync <command>
+In ANY new terminal opened after install, `study` works normally.
 
 Triggered via studysync_pathfix.pth installed into site-packages.
 """
@@ -18,11 +26,7 @@ import sys
 def _fix() -> None:
     if sys.platform != "win32":
         return
-
-    # --- 1. Create study.bat shim (works in current terminal immediately) ---
     _create_bat_shim()
-
-    # --- 2. Fix registry PATH (works for new terminals + native study.exe) ---
     sentinel = os.path.join(os.path.expanduser("~"), ".study", ".path_fixed")
     if not os.path.exists(sentinel):
         _fix_registry()
@@ -34,30 +38,33 @@ def _fix() -> None:
 
 
 def _create_bat_shim() -> None:
-    """Write study.bat to the first writable user-space directory on PATH."""
     import shutil
 
     python_exe = sys.executable
     bat_content = '@echo off\r\n"' + python_exe + '" -m studysync %*\r\n'
 
-    # Candidate directories in priority order:
-    #   a) dirname(shutil.which("python")) — the python dir actually on PATH
-    #   b) dirname(sys.executable) — where Python really lives
-    #   c) every directory currently in PATH
-    candidates: list = []
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    appdata = os.environ.get("APPDATA", "")
+    user_home = os.path.expanduser("~")
 
+    # Priority-ordered candidate directories
+    candidates = []
+
+    # 1. WindowsApps — on PATH by default on every Windows 10/11 machine
+    if localappdata:
+        candidates.append(os.path.join(localappdata, "Microsoft", "WindowsApps"))
+
+    # 2. dirname of python.exe that's on PATH (shutil.which finds it)
     python_on_path = shutil.which("python") or shutil.which("python3")
     if python_on_path:
         candidates.append(os.path.dirname(python_on_path))
 
+    # 3. dirname of sys.executable (the real Python binary)
     candidates.append(os.path.dirname(python_exe))
 
-    path_env = os.environ.get("PATH", "")
-    candidates.extend(path_env.split(os.pathsep))
-
-    user_home     = os.path.expanduser("~").lower()
-    appdata       = os.environ.get("APPDATA", "").lower()
-    localappdata  = os.environ.get("LOCALAPPDATA", "").lower()
+    # 4. Every directory currently in PATH (user-space only)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        candidates.append(d)
 
     seen: set = set()
     for d in candidates:
@@ -71,27 +78,27 @@ def _create_bat_shim() -> None:
         if not os.path.isdir(d):
             continue
 
-        # Only touch user-space directories (avoids system dirs that need admin)
+        # Only touch user-space directories
         dl = d.lower()
-        if not (dl.startswith(user_home) or
-                dl.startswith(appdata) or
-                dl.startswith(localappdata)):
+        uh = user_home.lower()
+        ad = appdata.lower()
+        la = localappdata.lower()
+        if not (dl.startswith(uh) or dl.startswith(ad) or dl.startswith(la)):
             continue
 
         bat_path = os.path.join(d, "study.bat")
         if os.path.exists(bat_path):
-            return  # already installed, nothing to do
+            return  # already installed
 
         try:
             with open(bat_path, "w") as f:
                 f.write(bat_content)
             return  # success
         except (PermissionError, OSError):
-            continue  # try next candidate
+            continue
 
 
 def _fix_registry() -> None:
-    """Add the Python Scripts directory to the user's registry PATH."""
     exe_dir = os.path.dirname(sys.executable)
     candidates = [
         os.path.join(exe_dir, "Scripts"),
@@ -121,7 +128,6 @@ def _fix_registry() -> None:
             reg_path, _ = winreg.QueryValueEx(key, "PATH")
         except FileNotFoundError:
             reg_path = ""
-
         if scripts_dir.lower() not in reg_path.lower():
             new_path = reg_path + ";" + scripts_dir if reg_path else scripts_dir
             winreg.SetValueEx(key, "PATH", 0, winreg.REG_EXPAND_SZ, new_path)
@@ -132,7 +138,6 @@ def _fix_registry() -> None:
                 )
             except Exception:
                 pass
-
         winreg.CloseKey(key)
     except Exception:
         pass

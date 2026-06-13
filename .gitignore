@@ -1,6 +1,28 @@
-dist/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Distribution / packaging
+dist/
+build/
+
+# Database & uploads (backend runtime files)
 *.db
-.env
-.env.example
+uploads/
+s3_store/
+
+# Test files
+a_file.txt
+notes.txt
+test.txt
+
+# OS
+.DS_Store
+Thumbs.db
