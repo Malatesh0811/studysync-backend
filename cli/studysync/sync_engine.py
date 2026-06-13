@@ -1,89 +1,48 @@
-"""
-sync_engine.py — Networking, OCC logic, and S3 streaming.
-
-All HTTP calls to the StudySync server and all direct S3 streaming live here.
-The Typer commands in main.py are thin wrappers that call into SyncEngine.
-
-Key design decisions
---------------------
-* Streaming uploads:  We open the local file as a binary file object and wrap
-  it in a progress-tracking shim.  `requests` reads the wrapper's `.read()`
-  method and forwards the Content-Length header we set explicitly, which is
-  required for S3 presigned PUT URLs.
-* Streaming downloads: `requests` streaming GET + chunk-writing gives us a
-  constant memory footprint regardless of file size.
-* No retries: This is v1.  Production systems should add exponential backoff
-  with `tenacity` or `urllib3.Retry`.
-"""
-
+"""sync_engine.py -- All HTTP calls and sync logic for StudySync CLI."""
 from __future__ import annotations
 
 import os
 import shutil
 import sys
-
-from .constants import PRODUCTION_SERVER_URL
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import requests
+from requests import HTTPError, Session
 from rich.console import Console
+from rich.panel import Panel
 from rich.progress import (
     BarColumn,
     DownloadColumn,
     Progress,
-    SpinnerColumn,
     TextColumn,
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
 from rich.table import Table
 
+from .constants import PRODUCTION_SERVER_URL
 from .local_state import (
     all_local_files,
+    ensure_dirs,
     load_config,
     load_manifest,
     local_file_path,
     sha256_file,
-    to_relative_path,
     update_manifest_entry,
     workspace_root,
     WORKSPACES_DIR,
 )
 
-console = Console(stderr=False)
+console = Console()
 
-UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024    # 8 MiB
-DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MiB
-HTTP_TIMEOUT = 20                       # seconds for metadata calls
-STREAM_TIMEOUT = 600                    # seconds for S3 streaming
-
-
-# ---------------------------------------------------------------------------
-# Progress-aware file wrapper for streaming uploads
-# ---------------------------------------------------------------------------
 
 class _ProgressReader:
-    """
-    File-like wrapper that reports bytes read to a Rich Progress task.
-
-    requests calls `.read(size)` on whatever you pass as `data=`, so this
-    wrapper intercepts those reads and advances the progress bar.  Exposing
-    `__len__` lets requests set the Content-Length header automatically, which
-    is mandatory for S3 presigned PUT URLs.
-    """
-
-    def __init__(
-        self,
-        fh,
-        total: int,
-        progress: Progress,
-        task_id,
-    ) -> None:
-        self._fh = fh
-        self._total = total
-        self._progress = progress
+    def __init__(self, path: Path, task_id: Any, progress: Progress) -> None:
+        self._fh = open(path, "rb")
         self._task_id = task_id
+        self._progress = progress
+        self._size = path.stat().st_size
 
     def read(self, size: int = -1) -> bytes:
         chunk = self._fh.read(size)
@@ -92,43 +51,71 @@ class _ProgressReader:
         return chunk
 
     def __len__(self) -> int:
-        return self._total
+        return self._size
 
+    def close(self) -> None:
+        self._fh.close()
 
-# ---------------------------------------------------------------------------
-# SyncEngine
-# ---------------------------------------------------------------------------
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
 
 class SyncEngine:
-    """
-    Encapsulates all network operations for the StudySync CLI.
-
-    Parameters override config.json values — useful for workspace create/join
-    where config hasn't been saved yet.
-    """
-
-    def __init__(
-        self,
-        server_url: Optional[str] = None,
-        workspace_token: Optional[str] = None,
-        workspace_name: Optional[str] = None,
-    ) -> None:
+    def __init__(self, server_url: Optional[str] = None) -> None:
+        ensure_dirs()
         config = load_config()
         raw_url = server_url or config.get("server_url", PRODUCTION_SERVER_URL)
-        self.server_url = raw_url.rstrip("/")
-        self.workspace_token = workspace_token or config.get("workspace_token")
-        self.workspace_name = workspace_name or config.get("workspace_name")
+        self.base_url: str = raw_url.rstrip("/")
+        self.workspace_id: str = config.get("workspace_id", "")
+        self.workspace_name: str = config.get("workspace_name", "")
+        self.token: str = config.get("workspace_token", "")
+        self.session: Session = requests.Session()
+        if self.token:
+            self.session.headers["Authorization"] = "Bearer " + self.token
+        self.session.headers["User-Agent"] = "studysync-cli/1.0"
 
     # ------------------------------------------------------------------
-    # Guard
+    # Helpers
     # ------------------------------------------------------------------
+
+    def _raise_for_status(self, resp: requests.Response) -> None:
+        if resp.ok:
+            return
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        raise HTTPError("HTTP " + str(resp.status_code) + ": " + str(detail), response=resp)
+
+    def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", 90)
+        try:
+            return self.session.request(method, url, **kwargs)
+        except requests.ReadTimeout:
+            console.print("[yellow]Server is waking up (cold start) -- retrying...[/yellow]")
+            kwargs["timeout"] = 120
+            return self.session.request(method, url, **kwargs)
+
+    def _get(self, url: str, **kwargs: Any) -> requests.Response:
+        return self._request("GET", url, **kwargs)
+
+    def _post(self, url: str, **kwargs: Any) -> requests.Response:
+        return self._request("POST", url, **kwargs)
 
     def _require_workspace(self) -> None:
-        if not self.workspace_token or not self.workspace_name:
+        if not self.workspace_id or not self.token:
             console.print(
-                "[red]No active workspace.  "
-                "Run [bold]study workspace create <name>[/bold] or "
-                "[bold]study join <token>[/bold] first.[/red]"
+                Panel(
+                    "No workspace configured.\n\n"
+                    "Create: [cyan]study workspace create <name>[/cyan]\n"
+                    "Join:   [cyan]study join <token-or-name>[/cyan]",
+                    title="[bold red]Not configured[/bold red]",
+                    border_style="red",
+                    padding=(1, 2),
+                )
             )
             sys.exit(1)
 
@@ -137,379 +124,88 @@ class SyncEngine:
     # ------------------------------------------------------------------
 
     def create_workspace(self, name: str) -> dict:
-        resp = requests.post(
-            f"{self.server_url}/workspaces",
-            json={"name": name},
-            timeout=HTTP_TIMEOUT,
-        )
-        if resp.status_code == 409:
+        resp = self._post(self.base_url + "/workspaces", json={"name": name})
+        self._raise_for_status(resp)
+        data = resp.json()
+        return {
+            "workspace_id": data["workspace_id"],
+            "access_token": data["access_token"],
+            "name": data["name"],
+        }
+
+    def resolve_input(self, token_or_alias: str) -> dict:
+        try:
+            resp = self._get(self.base_url + "/resolve/" + token_or_alias)
+            self._raise_for_status(resp)
+            return resp.json()
+        except HTTPError as exc:
+            code = exc.response.status_code if exc.response is not None else "?"
+            try:
+                detail = exc.response.json().get("detail", str(exc))
+            except Exception:
+                detail = str(exc)
             console.print(
-                f"[red]A workspace named '[bold]{name}[/bold]' already exists on the server.[/red]"
+                Panel(
+                    "Could not resolve '" + token_or_alias + "'\n\n" + str(detail),
+                    title="[bold red]HTTP " + str(code) + " -- Not found[/bold red]",
+                    border_style="red",
+                    padding=(1, 2),
+                )
             )
             sys.exit(1)
-        _raise_for_status(resp)
-        return resp.json()
-
-    def join_workspace(self, token: str) -> dict:
-        resp = requests.post(
-            f"{self.server_url}/workspaces/join",
-            json={"token": token},
-            timeout=HTTP_TIMEOUT,
-        )
-        if resp.status_code in (401, 404):
-            console.print("[red]Invalid token — workspace not found.[/red]")
+        except requests.ConnectionError:
+            console.print(
+                Panel(
+                    "Cannot reach the server at:\n  " + self.base_url,
+                    title="[bold red]Connection error[/bold red]",
+                    border_style="red",
+                    padding=(1, 2),
+                )
+            )
             sys.exit(1)
-        _raise_for_status(resp)
-        return resp.json()
-
-    # ------------------------------------------------------------------
-    # Remote state
-    # ------------------------------------------------------------------
-
-    def get_remote_state(self) -> list[dict]:
-        self._require_workspace()
-        resp = requests.get(
-            f"{self.server_url}/sync/state/{self.workspace_token}",
-            timeout=HTTP_TIMEOUT,
-        )
-        _raise_for_status(resp)
-        return resp.json()["files"]
 
     # ------------------------------------------------------------------
     # pull
     # ------------------------------------------------------------------
 
     def pull(self) -> None:
-        """
-        Compare remote state to the local manifest and download every file
-        that is absent or outdated locally.
-
-        A file is considered up-to-date if:
-        1. Its manifest entry version matches the remote version, AND
-        2. The physical file on disk still matches the manifest checksum.
-
-        Condition 2 catches the edge case where someone manually edited the
-        file without going through `study push`.
-        """
         self._require_workspace()
-        assert self.workspace_name  # guarded by _require_workspace
+        cwd = Path(os.getcwd())
 
-        console.print(
-            f"[blue]Fetching remote state for workspace "
-            f"'[bold]{self.workspace_name}[/bold]'…[/blue]"
-        )
+        with console.status("[blue]Fetching workspace state...[/blue]", spinner="dots"):
+            try:
+                resp = self._get(self.base_url + "/sync/state/" + self.token)
+                self._raise_for_status(resp)
+            except (HTTPError, requests.ConnectionError) as exc:
+                console.print(Panel(str(exc), title="[bold red]Pull failed[/bold red]",
+                                    border_style="red", padding=(1, 2)))
+                sys.exit(1)
 
-        remote_files = self.get_remote_state()
+        remote_files = {f["file_path"]: f for f in resp.json().get("files", [])}
+
         if not remote_files:
-            console.print("[green]Workspace is empty.  Nothing to pull.[/green]")
+            console.print("[green]Workspace is empty -- nothing to pull.[/green]")
             return
 
         manifest = load_manifest()
-        to_download: list[dict] = []
+        to_download = []
 
-        for rf in remote_files:
-            file_path: str = rf["file_path"]
-            remote_version: int = rf["latest_version"]
-            remote_checksum: str = rf.get("latest_checksum") or ""
-
-            local_entry = manifest.get(file_path)
-            dest = local_file_path(self.workspace_name, file_path)
-
-            if local_entry and local_entry["version"] == remote_version:
-                # Version matches — verify the physical file hasn't drifted.
-                if dest.exists():
-                    if sha256_file(dest) == remote_checksum:
-                        continue  # Truly up to date
-                    # File was modified locally without a push — pull wins.
-                    console.print(
-                        f"[yellow]  Overwriting locally-modified "
-                        f"'[bold]{file_path}[/bold]' with remote v{remote_version}[/yellow]"
-                    )
-
-            to_download.append(rf)
+        for fp, rf in remote_files.items():
+            remote_ver = rf.get("latest_version", 0)
+            local_entry = manifest.get(fp, {})
+            local_ver = local_entry.get("version", 0)
+            file_on_disk = (cwd / fp).exists()
+            if not file_on_disk or local_ver < remote_ver:
+                to_download.append(rf)
 
         if not to_download:
-            console.print("[green]✓ Everything is up to date.[/green]")
+            console.print("[green]Everything is up to date.[/green]")
             return
 
-        console.print(f"[blue]Downloading [bold]{len(to_download)}[/bold] file(s)…[/blue]")
+        console.print("[blue]Downloading " + str(len(to_download)) + " file(s)...[/blue]")
 
-        success = 0
-        for rf in to_download:
-            file_path = rf["file_path"]
-            remote_version = rf["latest_version"]
-            remote_checksum = rf.get("latest_checksum") or ""
-            size_bytes: Optional[int] = rf.get("size_bytes")
-
-            console.print(f"  → [cyan]{file_path}[/cyan]  [dim]v{remote_version}[/dim]")
-            try:
-                dl_info = self._request_download(file_path)
-                dest = local_file_path(self.workspace_name, file_path)
-                self._stream_download(dl_info["presigned_url"], dest, size_bytes)
-
-                # Integrity check
-                actual_checksum = sha256_file(dest)
-                if actual_checksum != remote_checksum:
-                    console.print(
-                        f"  [red]✗ Checksum mismatch for '{file_path}'.  "
-                        f"Expected {remote_checksum[:12]}… got {actual_checksum[:12]}…  "
-                        "File deleted.[/red]"
-                    )
-                    dest.unlink(missing_ok=True)
-                    continue
-
-                update_manifest_entry(file_path, remote_version, remote_checksum)
-
-                # ----------------------------------------------------------
-                # Checkout phase: copy from vault → current working directory
-                # ----------------------------------------------------------
-                cwd = Path(os.getcwd())
-                checkout_dest = cwd / file_path
-                checkout_dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dest, checkout_dest)
-
-                console.print(
-                    f"  [green]✓ {file_path}[/green]  "
-                    f"[dim]→ ./{Path(file_path).as_posix()}[/dim]"
-                )
-                success += 1
-
-            except Exception as exc:
-                console.print(f"  [red]✗ Failed to download '{file_path}': {exc}[/red]")
-
-        console.print(
-            f"[green]Pull complete — [bold]{success}/{len(to_download)}[/bold] file(s) "
-            f"updated in vault and checked out to [bold]{os.getcwd()}[/bold].[/green]"
-        )
-
-    # ------------------------------------------------------------------
-    # push
-    # ------------------------------------------------------------------
-
-    def push(self, file_path_arg: str) -> None:
-        """
-        Push a single file to the remote workspace.
-
-        Accepts either:
-        * A workspace-relative path  ("src/main.py")
-        * An absolute/relative OS path — the file is copied into the workspace
-          directory if it lives outside it.
-
-        OCC flow:
-        1. Hash the local file.
-        2. Read base_version from the manifest (0 if untracked/new).
-        3. POST /sync/upload-request → 409 means remote has diverged → abort.
-        4. Stream PUT to the presigned S3 URL.
-        5. POST /sync/commit-upload.
-        6. Update manifest.
-        """
-        self._require_workspace()
-        assert self.workspace_name
-
-        ws_root = workspace_root(self.workspace_name)
-
-        # Resolve the file and its workspace-relative key
-        abs_path, relative = self._resolve_push_path(file_path_arg, ws_root)
-
-        console.print(f"[blue]Hashing [bold]{relative}[/bold]…[/blue]")
-        checksum = sha256_file(abs_path)
-        size_bytes = abs_path.stat().st_size
-
-        # Check against manifest: skip if nothing changed
-        manifest = load_manifest()
-        local_entry = manifest.get(relative)
-        if local_entry and local_entry["checksum"] == checksum:
-            console.print(
-                f"[yellow]No changes detected in '[bold]{relative}[/bold]'.  Nothing to push.[/yellow]"
-            )
-            return
-
-        base_version = local_entry["version"] if local_entry else 0
-
-        # --- OCC gate ---
-        console.print(
-            f"[blue]Requesting upload slot  "
-            f"[dim](base_version={base_version})[/dim]…[/blue]"
-        )
-        resp = requests.post(
-            f"{self.server_url}/sync/upload-request",
-            json={
-                "workspace_token": self.workspace_token,
-                "file_path": relative,
-                "base_version": base_version,
-                "checksum": checksum,
-                "size_bytes": size_bytes,
-            },
-            timeout=HTTP_TIMEOUT,
-        )
-
-        if resp.status_code == 409:
-            detail = resp.json().get("detail", "Remote has diverged.")
-            console.print(
-                f"\n[bold red]⚠  CONFLICT — Remote has changes.  Pull first.[/bold red]\n"
-                f"[red]{detail}[/red]\n"
-                f"  Run: [cyan]study pull[/cyan]\n"
-            )
-            sys.exit(1)
-
-        _raise_for_status(resp)
-        upload_info = resp.json()
-
-        upload_id: str = upload_info["upload_id"]
-        presigned_url: str = upload_info["presigned_url"]
-        new_version: int = upload_info["new_version"]
-
-        # --- Stream to S3 ---
-        console.print(f"[blue]Uploading to S3  [dim]({size_bytes:,} bytes)[/dim]…[/blue]")
-        try:
-            self._stream_upload(presigned_url, abs_path, size_bytes)
-        except Exception as exc:
-            console.print(f"[red]✗ S3 upload failed: {exc}[/red]")
-            console.print(
-                "[yellow]The upload slot has been allocated but the file was not written.  "
-                "You can retry — the slot will expire automatically.[/yellow]"
-            )
-            sys.exit(1)
-
-        # --- Commit ---
-        console.print("[blue]Committing…[/blue]")
-        try:
-            commit_resp = requests.post(
-                f"{self.server_url}/sync/commit-upload",
-                json={"upload_id": upload_id},
-                timeout=HTTP_TIMEOUT,
-            )
-            _raise_for_status(commit_resp)
-        except Exception as exc:
-            console.print(
-                f"[red]✗ Commit failed: {exc}\n"
-                "The file was uploaded to S3 but the server did not record it.  "
-                "Contact your administrator with upload_id=[bold]{upload_id}[/bold].[/red]"
-            )
-            sys.exit(1)
-
-        # --- Update manifest ---
-        update_manifest_entry(relative, new_version, checksum)
-        console.print(
-            f"[green]✓ Pushed '[bold]{relative}[/bold]' → v{new_version}[/green]"
-        )
-
-    # ------------------------------------------------------------------
-    # status
-    # ------------------------------------------------------------------
-
-    def status(self) -> None:
-        """
-        Compare every tracked file's on-disk SHA-256 against the manifest.
-
-        States:
-        CLEAN     — matches manifest checksum
-        MODIFIED  — exists on disk but checksum differs
-        DELETED   — tracked in manifest but missing on disk
-        UNTRACKED — present on disk but not in manifest
-        """
-        self._require_workspace()
-        assert self.workspace_name
-
-        manifest = load_manifest()
-        ws_root = workspace_root(self.workspace_name)
-
-        table = Table(
-            title=f"Workspace: [bold]{self.workspace_name}[/bold]",
-            show_lines=False,
-            header_style="bold",
-        )
-        table.add_column("File", style="cyan", no_wrap=True)
-        table.add_column("Status", justify="center")
-        table.add_column("Ver", justify="right", style="dim")
-        table.add_column("Checksum", style="dim", no_wrap=True)
-
-        tracked_paths: set[str] = set(manifest.keys())
-        rows: list[tuple] = []
-
-        for file_path, entry in manifest.items():
-            dest = local_file_path(self.workspace_name, file_path)
-            ver = str(entry["version"])
-            if not dest.exists():
-                rows.append((file_path, "[red]DELETED[/red]", ver, entry["checksum"][:14] + "…"))
-            else:
-                current = sha256_file(dest)
-                if current == entry["checksum"]:
-                    rows.append((file_path, "[green]CLEAN[/green]", ver, current[:14] + "…"))
-                else:
-                    rows.append((file_path, "[yellow]MODIFIED[/yellow]", ver, current[:14] + "…"))
-
-        # Untracked files
-        for abs_path in all_local_files(self.workspace_name):
-            rel = to_relative_path(self.workspace_name, abs_path)
-            if rel not in tracked_paths:
-                rows.append((rel, "[blue]UNTRACKED[/blue]", "-", "-"))
-
-        if not rows:
-            console.print(
-                f"[yellow]Workspace '[bold]{self.workspace_name}[/bold]' is empty locally.  "
-                "Run [cyan]study pull[/cyan] to download files.[/yellow]"
-            )
-            return
-
-        for row in sorted(rows, key=lambda r: r[0]):
-            table.add_row(*row)
-
-        console.print(table)
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _request_download(self, file_path: str) -> dict:
-        resp = requests.get(
-            f"{self.server_url}/sync/download-request",
-            params={
-                "workspace_token": self.workspace_token,
-                "file_path": file_path,
-            },
-            timeout=HTTP_TIMEOUT,
-        )
-        _raise_for_status(resp)
-        return resp.json()
-
-    def _stream_download(
-        self,
-        presigned_url: str,
-        dest: Path,
-        file_size: Optional[int] = None,
-    ) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-
-        with requests.get(presigned_url, stream=True, timeout=STREAM_TIMEOUT) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("Content-Length", file_size or 0)) or None
-
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                DownloadColumn(),
-                TransferSpeedColumn(),
-                TimeRemainingColumn(),
-                console=console,
-                transient=True,
-            ) as progress:
-                task = progress.add_task(dest.name, total=total)
-                with open(dest, "wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                        if chunk:
-                            fh.write(chunk)
-                            progress.update(task, advance=len(chunk))
-
-    def _stream_upload(
-        self,
-        presigned_url: str,
-        local_path: Path,
-        size_bytes: int,
-    ) -> None:
+        errors = []
         with Progress(
-            SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             DownloadColumn(),
@@ -518,78 +214,233 @@ class SyncEngine:
             console=console,
             transient=True,
         ) as progress:
-            task = progress.add_task(local_path.name, total=size_bytes)
+            for rf in to_download:
+                fp = rf["file_path"]
+                remote_ver = rf.get("latest_version", 0)
+                remote_cksum = rf.get("latest_checksum", "")
+                size = rf.get("size_bytes") or 0
 
-            with open(local_path, "rb") as fh:
-                reader = _ProgressReader(fh, size_bytes, progress, task)
-                resp = requests.put(
+                task_id = progress.add_task(fp, total=size if size > 0 else None)
+
+                try:
+                    dl = self._get(
+                        self.base_url + "/sync/download-request",
+                        params={"workspace_token": self.token, "file_path": fp},
+                    )
+                    self._raise_for_status(dl)
+                except (HTTPError, requests.ConnectionError) as exc:
+                    errors.append(fp + ": " + str(exc))
+                    progress.update(task_id, visible=False)
+                    continue
+
+                presigned_url = dl.json()["presigned_url"]
+
+                vault_path = local_file_path(self.workspace_name, fp)
+                vault_path.parent.mkdir(parents=True, exist_ok=True)
+
+                try:
+                    with requests.get(presigned_url, stream=True, timeout=120) as r:
+                        r.raise_for_status()
+                        with open(vault_path, "wb") as fh:
+                            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                                if chunk:
+                                    fh.write(chunk)
+                                    progress.update(task_id, advance=len(chunk))
+                except Exception as exc:
+                    errors.append(fp + ": " + str(exc))
+                    progress.update(task_id, visible=False)
+                    continue
+
+                actual = sha256_file(vault_path)
+                if remote_cksum and actual != remote_cksum:
+                    errors.append(fp + ": checksum mismatch")
+                    vault_path.unlink(missing_ok=True)
+                    progress.update(task_id, visible=False)
+                    continue
+
+                update_manifest_entry(fp, remote_ver, actual)
+
+                dest = cwd / fp
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(vault_path, dest)
+
+        if errors:
+            for e in errors:
+                console.print("[red]Failed: " + e + "[/red]")
+        ok = len(to_download) - len(errors)
+        console.print(
+            "[green]Pull complete -- " + str(ok) + "/" + str(len(to_download))
+            + " file(s) written to " + str(cwd) + "[/green]"
+        )
+
+    # ------------------------------------------------------------------
+    # push
+    # ------------------------------------------------------------------
+
+    def push(self, file_path_arg: str) -> None:
+        self._require_workspace()
+
+        src = Path(file_path_arg).expanduser().resolve()
+        if not src.exists():
+            console.print(Panel("File not found: " + file_path_arg,
+                                title="[bold red]File not found[/bold red]",
+                                border_style="red", padding=(1, 2)))
+            sys.exit(1)
+
+        file_path = src.name
+        checksum = sha256_file(src)
+        size = src.stat().st_size
+
+        manifest = load_manifest()
+        local_entry = manifest.get(file_path, {})
+
+        if local_entry.get("checksum") == checksum:
+            console.print("[yellow]No changes detected in '" + file_path + "' -- nothing to push.[/yellow]")
+            return
+
+        base_version = local_entry.get("version", 0)
+
+        with console.status("[blue]Requesting upload slot...[/blue]", spinner="dots"):
+            try:
+                req = self._post(
+                    self.base_url + "/sync/upload-request",
+                    json={
+                        "workspace_token": self.token,
+                        "file_path": file_path,
+                        "checksum": checksum,
+                        "size_bytes": size,
+                        "base_version": base_version,
+                    },
+                )
+
+                if req.status_code == 409:
+                    try:
+                        detail = req.json().get("detail", "")
+                    except Exception:
+                        detail = req.text
+                    console.print(
+                        Panel(
+                            "'" + file_path + "' has been updated on the server since your last pull.\n\n"
+                            "Your local base version: " + str(base_version) + "\n\n"
+                            "Run [cyan]study pull[/cyan] first, then push again.\n\n"
+                            + str(detail),
+                            title="[bold red]Conflict -- pull required[/bold red]",
+                            border_style="red",
+                            padding=(1, 2),
+                        )
+                    )
+                    sys.exit(1)
+
+                self._raise_for_status(req)
+
+            except HTTPError as exc:
+                console.print(Panel(str(exc), title="[bold red]Upload request failed[/bold red]",
+                                    border_style="red", padding=(1, 2)))
+                sys.exit(1)
+
+        data = req.json()
+        presigned_url = data["presigned_url"]
+        upload_id = data["upload_id"]
+        new_version = data["new_version"]
+
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task_id = progress.add_task("Uploading " + file_path, total=size)
+            with open(src, "rb") as fh:
+                reader = _ProgressReader(src, task_id, progress)
+                put_resp = self.session.put(
                     presigned_url,
                     data=reader,
                     headers={
-                        "Content-Length": str(size_bytes),
+                        "Content-Length": str(size),
                         "Content-Type": "application/octet-stream",
                     },
-                    timeout=STREAM_TIMEOUT,
+                    timeout=300,
                 )
-                resp.raise_for_status()
+                put_resp.raise_for_status()
 
-    def _resolve_push_path(
-        self,
-        file_path_arg: str,
-        ws_root: Path,
-    ) -> tuple[Path, str]:
-        """
-        Return (absolute_path, workspace_relative_posix_key).
+        with console.status("[blue]Committing...[/blue]", spinner="dots"):
+            try:
+                commit = self._post(self.base_url + "/sync/commit-upload",
+                                    json={"upload_id": upload_id})
+                self._raise_for_status(commit)
+            except (HTTPError, requests.ConnectionError) as exc:
+                console.print(Panel(str(exc), title="[bold red]Commit failed[/bold red]",
+                                    border_style="red", padding=(1, 2)))
+                sys.exit(1)
 
-        Tries the arg as:
-        1. A path relative to the workspace root.
-        2. An absolute OS path — if the file is inside the workspace root,
-           derive the relative key.  If outside, copy it into the workspace
-           root (top-level, using the filename only).
-        """
-        import shutil
+        update_manifest_entry(file_path, new_version, checksum)
+        console.print("[green]Pushed '" + file_path + "' -> v" + str(new_version) + "[/green]")
 
-        # Attempt 1: relative to workspace root
-        candidate = ws_root / file_path_arg
-        if candidate.exists():
-            return candidate, file_path_arg.replace("\\", "/")
+    # ------------------------------------------------------------------
+    # status
+    # ------------------------------------------------------------------
 
-        # Attempt 2: treat as an OS path
-        os_path = Path(file_path_arg).expanduser().resolve()
-        if not os_path.exists():
-            console.print(f"[red]File not found: {file_path_arg}[/red]")
-            sys.exit(1)
+    def status(self) -> None:
+        self._require_workspace()
+        cwd = Path(os.getcwd())
 
-        try:
-            # File is already inside the workspace directory
-            relative = os_path.relative_to(ws_root).as_posix()
-            return os_path, relative
-        except ValueError:
-            pass
+        with console.status("[blue]Fetching server state...[/blue]", spinner="dots"):
+            try:
+                resp = self._get(self.base_url + "/sync/state/" + self.token)
+                self._raise_for_status(resp)
+                remote_files = {f["file_path"]: f for f in resp.json().get("files", [])}
+            except (HTTPError, requests.ConnectionError):
+                remote_files = {}
 
-        # File is outside the workspace — copy it in
-        relative = os_path.name
-        dest = ws_root / relative
-        console.print(
-            f"[yellow]File is outside the workspace.  "
-            f"Copying to '[bold]{relative}[/bold]' inside workspace.[/yellow]"
-        )
-        shutil.copy2(os_path, dest)
-        return dest, relative
+        manifest = load_manifest()
 
+        all_paths = set(remote_files) | set(manifest)
+        for p in cwd.rglob("*"):
+            if p.is_file() and not str(p).startswith(str(Path.home() / ".study")):
+                try:
+                    rel = p.relative_to(cwd).as_posix()
+                    all_paths.add(rel)
+                except ValueError:
+                    pass
 
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
+        if not all_paths:
+            console.print("[yellow]No files tracked. Run [cyan]study push <file>[/cyan] to start.[/yellow]")
+            return
 
-def _raise_for_status(resp: requests.Response) -> None:
-    """Raise with a helpful message on HTTP errors."""
-    if not resp.ok:
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except Exception:
-            detail = resp.text
-        raise requests.HTTPError(
-            f"HTTP {resp.status_code}: {detail}",
-            response=resp,
-        )
+        table = Table(show_header=True, header_style="bold blue")
+        table.add_column("File", style="cyan", no_wrap=True)
+        table.add_column("Status", justify="center")
+        table.add_column("Local ver", justify="right", style="dim")
+        table.add_column("Server ver", justify="right", style="dim")
+
+        for fp in sorted(all_paths):
+            remote_info = remote_files.get(fp)
+            local_entry = manifest.get(fp, {})
+            file_on_disk = (cwd / fp).exists()
+            local_ver = str(local_entry.get("version", "-")) if local_entry else "-"
+            server_ver = str(remote_info.get("latest_version", "-")) if remote_info else "-"
+            local_cksum = local_entry.get("checksum", "") if local_entry else ""
+
+            if remote_info and not file_on_disk and not local_entry:
+                status_cell = "[cyan]NOT PULLED[/cyan]"
+            elif remote_info and not file_on_disk and local_entry:
+                status_cell = "[red]MISSING[/red]"
+            elif remote_info and file_on_disk:
+                disk_cksum = sha256_file(cwd / fp)
+                if disk_cksum == remote_info.get("latest_checksum", ""):
+                    status_cell = "[green]SYNCED[/green]"
+                elif disk_cksum == local_cksum:
+                    status_cell = "[cyan]NOT PULLED[/cyan]"
+                else:
+                    status_cell = "[yellow]MODIFIED[/yellow]"
+            elif not remote_info and file_on_disk:
+                status_cell = "[dim]LOCAL[/dim]"
+            else:
+                status_cell = "[dim]UNKNOWN[/dim]"
+
+            table.add_row(fp, status_cell, local_ver, server_ver)
+
+        console.print(table)
