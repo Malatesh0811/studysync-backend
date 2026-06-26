@@ -228,6 +228,7 @@ def create_workspace(
 
 class InviteRequest(BaseModel):
     email: str
+    workspace_token: Optional[str] = None
 
 
 @app.post("/workspaces/{workspace_id}/invite", tags=["workspaces"])
@@ -241,13 +242,23 @@ def invite_member(
     ws = db.query(Workspace).filter(Workspace.id == workspace_id).first()
     if not ws:
         raise HTTPException(status_code=404, detail="Workspace not found.")
+    # Ownership check: WorkspaceMember role=owner OR workspace_token holder
     caller_member = db.query(WorkspaceMember).filter(
         WorkspaceMember.workspace_id == workspace_id,
         WorkspaceMember.user_id == current_user.id,
         WorkspaceMember.role == "owner",
     ).first()
-    if not caller_member:
+    has_token = body.workspace_token and ws.access_token == body.workspace_token
+    if not caller_member and not has_token:
         raise HTTPException(status_code=403, detail="Only the workspace owner can invite members.")
+    # Ensure caller is registered as owner for future checks
+    if not caller_member and has_token:
+        existing = db.query(WorkspaceMember).filter(
+            WorkspaceMember.workspace_id == workspace_id,
+            WorkspaceMember.user_id == current_user.id,
+        ).first()
+        if not existing:
+            db.add(WorkspaceMember(workspace_id=workspace_id, user_id=current_user.id, role="owner"))
     invitee = db.query(User).filter(User.email == body.email.lower()).first()
     if not invitee:
         raise HTTPException(status_code=404, detail="No user found with that email. They must register first.")

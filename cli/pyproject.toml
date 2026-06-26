@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "study_sync"
-version = "1.1.4"
+version = "1.2.1"
 description = "Offline-first distributed workspace sync CLI."
 requires-python = ">=3.10"
 dependencies = [

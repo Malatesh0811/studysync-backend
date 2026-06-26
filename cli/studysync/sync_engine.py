@@ -307,12 +307,13 @@ class SyncEngine:
     def invite_member(self, email: str) -> dict:
         cfg = load_config()
         workspace_id = cfg.get("workspace_id", "")
+        workspace_token = cfg.get("workspace_token", "")
         if not workspace_id:
             console.print("[red]No workspace configured. Create one first.[/red]")
             sys.exit(1)
         resp = self.session.post(
             self.base_url + "/workspaces/" + workspace_id + "/invite",
-            json={"email": email},
+            json={"email": email, "workspace_token": workspace_token},
             headers=self._user_headers(),
             timeout=90,
         )
