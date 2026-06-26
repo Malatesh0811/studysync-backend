@@ -15,6 +15,7 @@ from rich import box
 from rich.console import Console
 from rich.padding import Padding
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
@@ -60,7 +61,7 @@ def _print_help_panel() -> None:
             Text.assemble(
                 ("StudySync", "bold cyan"),
                 ("  v" + __version__, "dim"),
-                "\nOffline-first, distributed workspace sync for developers.\n",
+                "\nOffline-first, distributed workspace sync for students.\n",
                 (DEFAULT_SERVER, "dim italic"),
             ),
             border_style="cyan",
@@ -73,12 +74,16 @@ def _print_help_panel() -> None:
     tbl.add_column("Description")
 
     for cmd, desc in [
-        ("study workspace create [NAME]", "Create a new workspace and print its share token"),
-        ("study join [TOKEN or NAME]",    "Join a workspace using its token or alias"),
-        ("study pull",                    "Download new/changed files from the remote workspace"),
-        ("study push [FILE]",             "Upload a local file to the remote workspace"),
-        ("study status",                  "Show the sync state of every tracked file"),
-        ("study config",                  "Display active workspace configuration"),
+        ("study register",                   "Create a new account"),
+        ("study login",                      "Login to your account"),
+        ("study workspace create [NAME]",    "Create a new workspace"),
+        ("study invite [EMAIL]",             "Invite a friend to your workspace"),
+        ("study workspace remove [EMAIL]",   "Remove a member from your workspace"),
+        ("study join [TOKEN or NAME]",       "Join a workspace using its token or name"),
+        ("study push [FILE]",                "Upload a file to the workspace"),
+        ("study pull",                       "Download new/changed files from workspace"),
+        ("study status",                     "Show sync state of every tracked file"),
+        ("study config",                     "Display active workspace configuration"),
     ]:
         tbl.add_row(cmd, desc)
 
@@ -87,9 +92,10 @@ def _print_help_panel() -> None:
     console.print(Rule("[bold]Quick start[/bold]", style="dim"))
     console.print(
         Padding(
-            "[dim]1.[/dim]  [cyan]pip install study_sync[/cyan]\n"
-            "[dim]2.[/dim]  [cyan]study join <TOKEN>[/cyan]\n"
-            "[dim]3.[/dim]  [cyan]study pull[/cyan]\n\n"
+            "[dim]1.[/dim]  [cyan]study register[/cyan]\n"
+            "[dim]2.[/dim]  [cyan]study workspace create mygroup[/cyan]\n"
+            "[dim]3.[/dim]  [cyan]study invite friend@gmail.com[/cyan]\n"
+            "[dim]4.[/dim]  [cyan]study push notes.pdf[/cyan]\n\n"
             "Type [cyan]study <command> --help[/cyan] for per-command options.",
             (0, 4, 1, 4),
         )
@@ -103,41 +109,43 @@ def _root_callback(ctx: typer.Context) -> None:
         raise typer.Exit()
 
 
-@workspace_app.command("create")
-def workspace_create(
-    name: str = typer.Argument(..., help="Unique workspace name to create on the server."),
+# ---------------------------------------------------------------------------
+# Auth commands
+# ---------------------------------------------------------------------------
+
+@app.command()
+def register(
     server: str = typer.Option(
         DEFAULT_SERVER, "--server", "-s",
-        help="Base URL of the StudySync server.",
         envvar="STUDYSYNC_SERVER", show_default=False,
     ),
 ) -> None:
-    """Create a new workspace and receive a shareable access token."""
+    """Create a new StudySync account."""
     ensure_dirs()
+    console.rule("[bold blue]study register[/bold blue]", style="dim blue")
+    email = Prompt.ask("[cyan]Email[/cyan]")
+    password = Prompt.ask("[cyan]Password[/cyan]", password=True)
+    confirm = Prompt.ask("[cyan]Confirm password[/cyan]", password=True)
+    if password != confirm:
+        console.print("[red]Passwords do not match.[/red]")
+        raise typer.Exit(1)
+
     engine = SyncEngine(server_url=server)
+    with console.status("[blue]Creating account...[/blue]", spinner="dots"):
+        result = engine.register(email, password)
 
-    with console.status(f"[blue]Creating workspace [bold]{name!r}[/bold]...[/blue]", spinner="dots"):
-        result = engine.create_workspace(name)
-
-    token: str = result["access_token"]
-    workspace_id: str = result["workspace_id"]
-
-    save_config({
-        "server_url": server,
-        "workspace_name": name,
-        "workspace_id": workspace_id,
-        "workspace_token": token,
-    })
-    workspace_root(name)
+    cfg = load_config()
+    cfg["user_token"] = result["access_token"]
+    cfg["user_email"] = result["email"]
+    cfg["server_url"] = server
+    save_config(cfg)
 
     console.print(
         Panel(
-            "[bold]Workspace[/bold]  " + name + "\n"
-            "[bold]Token    [/bold]  [yellow]" + token + "[/yellow]\n\n"
-            "Share with collaborators:\n"
-            "  [cyan]study join " + token + "[/cyan]\n"
-            "  [cyan]study join " + name + "[/cyan]  (alias also works)",
-            title="[bold green]Workspace created[/bold green]",
+            "[bold]Email  [/bold]  " + result["email"] + "\n\n"
+            "You are now logged in.\n"
+            "Next: [cyan]study workspace create <name>[/cyan]",
+            title="[bold green]Account created[/bold green]",
             border_style="green",
             padding=(1, 2),
         )
@@ -145,11 +153,133 @@ def workspace_create(
 
 
 @app.command()
+def login(
+    server: str = typer.Option(
+        DEFAULT_SERVER, "--server", "-s",
+        envvar="STUDYSYNC_SERVER", show_default=False,
+    ),
+) -> None:
+    """Login to your StudySync account."""
+    ensure_dirs()
+    console.rule("[bold blue]study login[/bold blue]", style="dim blue")
+    email = Prompt.ask("[cyan]Email[/cyan]")
+    password = Prompt.ask("[cyan]Password[/cyan]", password=True)
+
+    engine = SyncEngine(server_url=server)
+    with console.status("[blue]Logging in...[/blue]", spinner="dots"):
+        result = engine.login(email, password)
+
+    cfg = load_config()
+    cfg["user_token"] = result["access_token"]
+    cfg["user_email"] = result["email"]
+    cfg["server_url"] = server
+    save_config(cfg)
+
+    console.print(
+        Panel(
+            "Logged in as [bold]" + result["email"] + "[/bold]\n\n"
+            "Next: [cyan]study workspace create <name>[/cyan]  or  [cyan]study join <token>[/cyan]",
+            title="[bold green]Login successful[/bold green]",
+            border_style="green",
+            padding=(1, 2),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Workspace commands
+# ---------------------------------------------------------------------------
+
+@workspace_app.command("create")
+def workspace_create(
+    name: str = typer.Argument(..., help="Unique workspace name."),
+    server: str = typer.Option(
+        DEFAULT_SERVER, "--server", "-s",
+        envvar="STUDYSYNC_SERVER", show_default=False,
+    ),
+) -> None:
+    """Create a new workspace. You become the owner."""
+    ensure_dirs()
+    engine = SyncEngine(server_url=server)
+
+    with console.status("[blue]Creating workspace [bold]" + name + "[/bold]...[/blue]", spinner="dots"):
+        result = engine.create_workspace(name)
+
+    token: str = result["access_token"]
+    workspace_id: str = result["workspace_id"]
+
+    cfg = load_config()
+    cfg.update({
+        "server_url": server,
+        "workspace_name": name,
+        "workspace_id": workspace_id,
+        "workspace_token": token,
+    })
+    save_config(cfg)
+    workspace_root(name)
+
+    console.print(
+        Panel(
+            "[bold]Workspace[/bold]  " + name + "\n"
+            "[bold]Token    [/bold]  [yellow]" + token + "[/yellow]\n\n"
+            "Invite friends:\n"
+            "  [cyan]study invite friend@gmail.com[/cyan]\n\n"
+            "Or share the token:\n"
+            "  [cyan]study join " + token + "[/cyan]",
+            title="[bold green]Workspace created[/bold green]",
+            border_style="green",
+            padding=(1, 2),
+        )
+    )
+
+
+@workspace_app.command("remove")
+def workspace_remove(
+    email: str = typer.Argument(..., help="Email of the member to remove."),
+) -> None:
+    """Remove a member from your workspace. Owner only."""
+    console.rule("[bold blue]study workspace remove[/bold blue]", style="dim blue")
+    engine = SyncEngine()
+    with console.status("[blue]Removing " + email + "...[/blue]", spinner="dots"):
+        engine.remove_member(email)
+    console.print("[green]" + email + " removed from workspace.[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Invite
+# ---------------------------------------------------------------------------
+
+@app.command()
+def invite(
+    email: str = typer.Argument(..., help="Email address of the friend to invite."),
+) -> None:
+    """Invite a friend to your current workspace by email."""
+    console.rule("[bold blue]study invite[/bold blue]", style="dim blue")
+    engine = SyncEngine()
+    with console.status("[blue]Inviting " + email + "...[/blue]", spinner="dots"):
+        result = engine.invite_member(email)
+    console.print(
+        Panel(
+            "[bold]" + email + "[/bold] has been added to [bold]" + result["workspace_name"] + "[/bold].\n\n"
+            "They can now run:\n"
+            "  [cyan]study join " + result["access_token"] + "[/cyan]\n"
+            "  [cyan]study pull[/cyan]",
+            title="[bold green]Invited[/bold green]",
+            border_style="green",
+            padding=(1, 2),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Join
+# ---------------------------------------------------------------------------
+
+@app.command()
 def join(
     token_or_alias: str = typer.Argument(..., help="Workspace access token (UUID) or workspace name."),
     server: str = typer.Option(
         DEFAULT_SERVER, "--server", "-s",
-        help="Base URL of the StudySync server.",
         envvar="STUDYSYNC_SERVER", show_default=False,
     ),
 ) -> None:
@@ -157,7 +287,7 @@ def join(
     ensure_dirs()
     engine = SyncEngine(server_url=server)
 
-    with console.status(f"[blue]Resolving '{token_or_alias}'...[/blue]", spinner="dots"):
+    with console.status("[blue]Resolving '" + token_or_alias + "'...[/blue]", spinner="dots"):
         resolved = engine.resolve_input(token_or_alias)
 
     token: str = resolved["access_token"]
@@ -165,16 +295,18 @@ def join(
     workspace_id: str = resolved["workspace_id"]
     from_alias: bool = resolved["resolved_from_alias"]
 
-    save_config({
+    cfg = load_config()
+    cfg.update({
         "server_url": server,
         "workspace_name": workspace_name,
         "workspace_id": workspace_id,
         "workspace_token": token,
     })
+    save_config(cfg)
     workspace_root(workspace_name)
 
     alias_note = (
-        "\n[dim]Resolved alias '" + token_or_alias + "' to " + token + "[/dim]"
+        "\n[dim]Resolved alias '" + token_or_alias + "' → " + token + "[/dim]"
         if from_alias else ""
     )
 
@@ -191,6 +323,10 @@ def join(
         )
     )
 
+
+# ---------------------------------------------------------------------------
+# Sync commands
+# ---------------------------------------------------------------------------
 
 @app.command()
 def pull() -> None:
@@ -228,8 +364,8 @@ def config() -> None:
         console.print(
             Panel(
                 "No workspace is configured.\n\n"
-                "Create one:  [cyan]study workspace create <name>[/cyan]\n"
-                "Or join one: [cyan]study join <token>[/cyan]",
+                "Register:  [cyan]study register[/cyan]\n"
+                "Or join:   [cyan]study join <token>[/cyan]",
                 title="[bold yellow]Not configured[/bold yellow]",
                 border_style="yellow",
                 padding=(1, 2),
@@ -241,6 +377,7 @@ def config() -> None:
     local_path = WORKSPACES_DIR / workspace_name if workspace_name != "N/A" else "N/A"
 
     rows = [
+        ("User",         cfg.get("user_email", "N/A")),
         ("Workspace",    workspace_name),
         ("Server",       cfg.get("server_url", "N/A")),
         ("Token",        cfg.get("workspace_token", "N/A")),

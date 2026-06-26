@@ -271,8 +271,79 @@ class SyncEngine:
     # Workspace management
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Auth
+    # ------------------------------------------------------------------
+
+    def register(self, email: str, password: str) -> dict:
+        resp = self._post(self.base_url + "/auth/register",
+                          json={"email": email, "password": password})
+        self._raise_for_status(resp)
+        return resp.json()
+
+    def login(self, email: str, password: str) -> dict:
+        resp = self._post(self.base_url + "/auth/login",
+                          json={"email": email, "password": password})
+        self._raise_for_status(resp)
+        return resp.json()
+
+    def _user_headers(self) -> dict:
+        from .local_state import load_config
+        cfg = load_config()
+        token = cfg.get("user_token", "")
+        if not token:
+            console.print(
+                Panel(
+                    "You are not logged in.\n\n"
+                    "Run [cyan]study register[/cyan] or [cyan]study login[/cyan] first.",
+                    title="[bold red]Not logged in[/bold red]",
+                    border_style="red",
+                    padding=(1, 2),
+                )
+            )
+            sys.exit(1)
+        return {"Authorization": "Bearer " + token}
+
+    def invite_member(self, email: str) -> dict:
+        cfg = load_config()
+        workspace_id = cfg.get("workspace_id", "")
+        if not workspace_id:
+            console.print("[red]No workspace configured. Create one first.[/red]")
+            sys.exit(1)
+        resp = self.session.post(
+            self.base_url + "/workspaces/" + workspace_id + "/invite",
+            json={"email": email},
+            headers=self._user_headers(),
+            timeout=90,
+        )
+        self._raise_for_status(resp)
+        return resp.json()
+
+    def remove_member(self, email: str) -> dict:
+        cfg = load_config()
+        workspace_id = cfg.get("workspace_id", "")
+        if not workspace_id:
+            console.print("[red]No workspace configured.[/red]")
+            sys.exit(1)
+        resp = self.session.delete(
+            self.base_url + "/workspaces/" + workspace_id + "/members/" + email,
+            headers=self._user_headers(),
+            timeout=90,
+        )
+        self._raise_for_status(resp)
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Workspace management
+    # ------------------------------------------------------------------
+
     def create_workspace(self, name: str) -> dict:
-        resp = self._post(self.base_url + "/workspaces", json={"name": name})
+        resp = self.session.post(
+            self.base_url + "/workspaces",
+            json={"name": name},
+            headers=self._user_headers(),
+            timeout=90,
+        )
         self._raise_for_status(resp)
         data = resp.json()
         return {

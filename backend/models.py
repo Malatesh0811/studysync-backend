@@ -19,21 +19,7 @@ from sqlalchemy.orm import relationship
 from database import Base
 
 
-# ---------------------------------------------------------------------------
-# SQLite-compatible UUID column type
-# ---------------------------------------------------------------------------
-
 class GUID(TypeDecorator):
-    """
-    Platform-independent UUID type.
-
-    Uses PostgreSQL's native UUID type when available; stores as a 36-char
-    VARCHAR string on SQLite (and other databases).  Values are always
-    returned as Python ``uuid.UUID`` objects when ``as_uuid=True`` is the
-    intent, but here we store/return plain strings to keep things simple
-    and avoid any dialect dependency.
-    """
-
     impl = String(36)
     cache_ok = True
 
@@ -47,12 +33,11 @@ class GUID(TypeDecorator):
     def process_result_value(self, value, dialect):
         if value is None:
             return None
-        return str(value)   # return as string; callers wrap in str() anyway
+        return str(value)
 
 
 def _new_uuid() -> str:
     return str(uuid.uuid4())
-
 
 
 def _utcnow() -> datetime:
@@ -60,48 +45,60 @@ def _utcnow() -> datetime:
 
 
 # ---------------------------------------------------------------------------
+# users
+# ---------------------------------------------------------------------------
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(GUID(), primary_key=True, default=_new_uuid)
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    memberships = relationship(
+        "WorkspaceMember",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+
+# ---------------------------------------------------------------------------
 # workspaces
 # ---------------------------------------------------------------------------
 
 class Workspace(Base):
-    """
-    A named namespace that groups files.  Members authenticate with the
-    access_token (UUID v4) rather than passwords.
-    """
-
     __tablename__ = "workspaces"
 
     id = Column(GUID(), primary_key=True, default=_new_uuid)
     name = Column(String(255), nullable=False, unique=True, index=True)
-    access_token = Column(
-        GUID(),
-        nullable=False,
-        default=_new_uuid,
-        unique=True,
-        index=True,
-    )
+    access_token = Column(GUID(), nullable=False, default=_new_uuid, unique=True, index=True)
     created_at = Column(DateTime, nullable=False, default=_utcnow)
 
-    # relationships
-    files = relationship(
-        "File",
-        back_populates="workspace",
-        cascade="all, delete-orphan",
-        lazy="dynamic",
-    )
-    pending_uploads = relationship(
-        "PendingUpload",
-        back_populates="workspace",
-        cascade="all, delete-orphan",
-        lazy="dynamic",
-    )
-    aliases = relationship(
-        "Alias",
-        back_populates="workspace",
-        cascade="all, delete-orphan",
-        lazy="dynamic",
+    files = relationship("File", back_populates="workspace", cascade="all, delete-orphan", lazy="dynamic")
+    pending_uploads = relationship("PendingUpload", back_populates="workspace", cascade="all, delete-orphan", lazy="dynamic")
+    aliases = relationship("Alias", back_populates="workspace", cascade="all, delete-orphan", lazy="dynamic")
+    members = relationship("WorkspaceMember", back_populates="workspace", cascade="all, delete-orphan")
+
+
+# ---------------------------------------------------------------------------
+# workspace_members
+# ---------------------------------------------------------------------------
+
+class WorkspaceMember(Base):
+    __tablename__ = "workspace_members"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "user_id", name="uq_workspace_user"),
     )
 
+    id = Column(GUID(), primary_key=True, default=_new_uuid)
+    workspace_id = Column(GUID(), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(GUID(), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(String(20), nullable=False, default="member")  # "owner" or "member"
+    joined_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    workspace = relationship("Workspace", back_populates="members")
+    user = relationship("User", back_populates="memberships")
 
 
 # ---------------------------------------------------------------------------
@@ -109,138 +106,74 @@ class Workspace(Base):
 # ---------------------------------------------------------------------------
 
 class File(Base):
-    """
-    Tracks the *latest* state of a single file path inside a workspace.
-    The full history is stored in FileVersion rows.
-
-    latest_version starts at 0 (no content) and increments with every
-    successful push.  OCC checks compare the client's base_version against
-    this column before issuing a presigned PUT URL.
-    """
-
     __tablename__ = "files"
     __table_args__ = (
         UniqueConstraint("workspace_id", "file_path", name="uq_workspace_file_path"),
     )
 
     id = Column(GUID(), primary_key=True, default=_new_uuid)
-    workspace_id = Column(
-        GUID(),
-        ForeignKey("workspaces.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    workspace_id = Column(GUID(), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     file_path = Column(String(2048), nullable=False)
     latest_version = Column(Integer, nullable=False, default=0)
-    latest_checksum = Column(String(64), nullable=True)  # SHA-256 hex digest
+    latest_checksum = Column(String(64), nullable=True)
     size_bytes = Column(BigInteger, nullable=True)
+    pushed_by = Column(String(255), nullable=True)  # email of last pusher
     updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
 
-    # relationships
     workspace = relationship("Workspace", back_populates="files")
-    versions = relationship(
-        "FileVersion",
-        back_populates="file",
-        cascade="all, delete-orphan",
-        order_by="FileVersion.version_number",
-        lazy="dynamic",
-    )
+    versions = relationship("FileVersion", back_populates="file", cascade="all, delete-orphan",
+                            order_by="FileVersion.version_number", lazy="dynamic")
 
 
 # ---------------------------------------------------------------------------
-# file_versions  (silent history / audit log)
+# file_versions
 # ---------------------------------------------------------------------------
 
 class FileVersion(Base):
-    """
-    Immutable append-only record written on every successful commit-upload.
-    Enables point-in-time recovery without exposing this complexity to clients.
-    """
-
     __tablename__ = "file_versions"
 
     id = Column(GUID(), primary_key=True, default=_new_uuid)
-    file_id = Column(
-        GUID(),
-        ForeignKey("files.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    file_id = Column(GUID(), ForeignKey("files.id", ondelete="CASCADE"), nullable=False, index=True)
     version_number = Column(Integer, nullable=False)
-    checksum = Column(String(64), nullable=False)   # SHA-256 hex digest
+    checksum = Column(String(64), nullable=False)
     s3_object_key = Column(Text, nullable=False)
+    pushed_by = Column(String(255), nullable=True)
     created_at = Column(DateTime, nullable=False, default=_utcnow)
 
-    # relationships
     file = relationship("File", back_populates="versions")
 
 
 # ---------------------------------------------------------------------------
-# pending_uploads  (two-phase upload state)
+# pending_uploads
 # ---------------------------------------------------------------------------
 
 class PendingUpload(Base):
-    """
-    Short-lived record that bridges upload-request → commit-upload.
-
-    When the server issues a presigned PUT URL it also writes a PendingUpload
-    row.  The client streams the file directly to S3, then calls
-    /sync/commit-upload with the upload_id so the server can atomically:
-      1. Update files.latest_version / latest_checksum
-      2. Insert a FileVersion row
-      3. Delete this PendingUpload row
-
-    Rows older than `expires_at` are considered stale and rejected.
-    """
-
     __tablename__ = "pending_uploads"
 
     id = Column(GUID(), primary_key=True, default=_new_uuid)
-    workspace_id = Column(
-        GUID(),
-        ForeignKey("workspaces.id", ondelete="CASCADE"),
-        nullable=False,
-    )
+    workspace_id = Column(GUID(), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
     file_path = Column(String(2048), nullable=False)
     checksum = Column(String(64), nullable=False)
     s3_object_key = Column(Text, nullable=False)
     size_bytes = Column(BigInteger, nullable=True)
     new_version = Column(Integer, nullable=False)
+    pushed_by = Column(String(255), nullable=True)
     created_at = Column(DateTime, nullable=False, default=_utcnow)
     expires_at = Column(DateTime, nullable=False)
 
-    # relationships
     workspace = relationship("Workspace", back_populates="pending_uploads")
 
 
 # ---------------------------------------------------------------------------
-# aliases  (workspace name → UUID mapping)
+# aliases
 # ---------------------------------------------------------------------------
 
 class Alias(Base):
-    """
-    Maps a human-readable alias (workspace name) to a workspace UUID.
-
-    An alias row is written automatically when a workspace is created, using
-    the workspace name as the alias.  This lets users join with:
-
-        study join my-project
-
-    instead of a raw UUID token.  Additional aliases can be inserted manually.
-    """
-
     __tablename__ = "aliases"
 
     id = Column(GUID(), primary_key=True, default=_new_uuid)
     alias_name = Column(String(255), nullable=False, unique=True, index=True)
-    workspace_id = Column(
-        GUID(),
-        ForeignKey("workspaces.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    workspace_id = Column(GUID(), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     created_at = Column(DateTime, nullable=False, default=_utcnow)
 
-    # relationships
     workspace = relationship("Workspace", back_populates="aliases")
-
