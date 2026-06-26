@@ -238,7 +238,8 @@ def invite_member(
     db: Session = Depends(get_db),
     current_user: User = Depends(_get_current_user),
 ):
-    """Invite a registered user to the workspace. Only owner can invite."""
+    """Invite a registered user to the workspace. Owner or workspace_token holder can invite."""
+    from sqlalchemy.exc import IntegrityError
     ws = db.query(Workspace).filter(Workspace.id == workspace_id).first()
     if not ws:
         raise HTTPException(status_code=404, detail="Workspace not found.")
@@ -248,29 +249,39 @@ def invite_member(
         WorkspaceMember.user_id == current_user.id,
         WorkspaceMember.role == "owner",
     ).first()
-    has_token = body.workspace_token and ws.access_token == body.workspace_token
+    has_token = bool(body.workspace_token and ws.access_token == body.workspace_token)
     if not caller_member and not has_token:
         raise HTTPException(status_code=403, detail="Only the workspace owner can invite members.")
-    # Ensure caller is registered as owner for future checks
+    # Self-heal: register caller as owner if they proved ownership via token but have no member row
     if not caller_member and has_token:
         existing = db.query(WorkspaceMember).filter(
             WorkspaceMember.workspace_id == workspace_id,
             WorkspaceMember.user_id == current_user.id,
         ).first()
         if not existing:
-            db.add(WorkspaceMember(workspace_id=workspace_id, user_id=current_user.id, role="owner"))
+            try:
+                db.add(WorkspaceMember(workspace_id=workspace_id, user_id=current_user.id, role="owner"))
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+    # Find invitee
     invitee = db.query(User).filter(User.email == body.email.lower()).first()
     if not invitee:
         raise HTTPException(status_code=404, detail="No user found with that email. They must register first.")
+    # Check not already a member
     already = db.query(WorkspaceMember).filter(
         WorkspaceMember.workspace_id == workspace_id,
         WorkspaceMember.user_id == invitee.id,
     ).first()
     if already:
         raise HTTPException(status_code=400, detail="User is already a member.")
-    member = WorkspaceMember(workspace_id=workspace_id, user_id=invitee.id, role="member")
-    db.add(member)
-    db.commit()
+    try:
+        member = WorkspaceMember(workspace_id=workspace_id, user_id=invitee.id, role="member")
+        db.add(member)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="User is already a member.")
     return {"message": invitee.email + " added to workspace " + ws.name + ".",
             "access_token": ws.access_token, "workspace_name": ws.name}
 
