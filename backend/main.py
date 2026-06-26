@@ -440,8 +440,8 @@ def upload_request(body: UploadRequestBody, db: Session = Depends(get_db)):
             + ", client base is v" + str(body.base_version) + ". Pull first."
         ))
     new_version = current_version + 1
-    s3_key = s3.make_object_key(str(ws.id), body.file_path, new_version, body.checksum)
-    presigned = s3.generate_presigned_put(s3_key, body.size_bytes, "application/octet-stream")
+    s3_key = s3.build_s3_key(str(ws.id), body.file_path, new_version)
+    presigned_url_put = s3.generate_presigned_put(s3_key, body.size_bytes, "application/octet-stream")
     from models import _utcnow as _m_utcnow
     pending = PendingUpload(
         workspace_id=ws.id,
@@ -458,7 +458,7 @@ def upload_request(body: UploadRequestBody, db: Session = Depends(get_db)):
     db.refresh(pending)
     return UploadRequestResponse(
         upload_id=str(pending.id),
-        presigned_url=presigned.url,
+        presigned_url=presigned_url_put,
         new_version=new_version,
         expires_in_seconds=PENDING_UPLOAD_TTL_HOURS * 3600,
     )
@@ -532,12 +532,12 @@ def download_request(
     ).first()
     if not latest_ver:
         raise HTTPException(status_code=404, detail="No committed version found.")
-    presigned = s3.generate_presigned_get(latest_ver.s3_object_key)
+    presigned_url_get = s3.generate_presigned_get(latest_ver.s3_object_key)
     return DownloadResponse(
-        presigned_url=presigned.url,
+        presigned_url=presigned_url_get,
         file_path=file_path,
         version=file_row.latest_version,
-        expires_in_seconds=presigned.expiry,
+        expires_in_seconds=s3.expiry,
     )
 
 
