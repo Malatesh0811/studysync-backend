@@ -15,7 +15,6 @@ from rich import box
 from rich.console import Console
 from rich.padding import Padding
 from rich.panel import Panel
-from rich.prompt import Prompt
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
@@ -74,11 +73,7 @@ def _print_help_panel() -> None:
     tbl.add_column("Description")
 
     for cmd, desc in [
-        ("study register",                   "Create a new account"),
-        ("study login",                      "Login to your account"),
         ("study workspace create [NAME]",    "Create a new workspace"),
-        ("study invite [EMAIL]",             "Invite a friend to your workspace"),
-        ("study workspace remove [EMAIL]",   "Remove a member from your workspace"),
         ("study join [TOKEN or NAME]",       "Join a workspace using its token or name"),
         ("study push [FILE]",                "Upload a file to the workspace"),
         ("study pull",                       "Download new/changed files from workspace"),
@@ -92,10 +87,9 @@ def _print_help_panel() -> None:
     console.print(Rule("[bold]Quick start[/bold]", style="dim"))
     console.print(
         Padding(
-            "[dim]1.[/dim]  [cyan]study register[/cyan]\n"
-            "[dim]2.[/dim]  [cyan]study workspace create mygroup[/cyan]\n"
-            "[dim]3.[/dim]  [cyan]study invite friend@gmail.com[/cyan]\n"
-            "[dim]4.[/dim]  [cyan]study push notes.pdf[/cyan]\n\n"
+            "[dim]1.[/dim]  [cyan]study workspace create mygroup[/cyan]\n"
+            "[dim]2.[/dim]  [cyan]study join mygroup[/cyan]  (on friend's laptop)\n"
+            "[dim]3.[/dim]  [cyan]study push notes.pdf[/cyan]\n\n"
             "Type [cyan]study <command> --help[/cyan] for per-command options.",
             (0, 4, 1, 4),
         )
@@ -113,77 +107,6 @@ def _root_callback(ctx: typer.Context) -> None:
 # Auth commands
 # ---------------------------------------------------------------------------
 
-@app.command()
-def register(
-    server: str = typer.Option(
-        DEFAULT_SERVER, "--server", "-s",
-        envvar="STUDYSYNC_SERVER", show_default=False,
-    ),
-) -> None:
-    """Create a new StudySync account."""
-    ensure_dirs()
-    console.rule("[bold blue]study register[/bold blue]", style="dim blue")
-    email = Prompt.ask("[cyan]Email[/cyan]")
-    password = Prompt.ask("[cyan]Password[/cyan]", password=True)
-    confirm = Prompt.ask("[cyan]Confirm password[/cyan]", password=True)
-    if password != confirm:
-        console.print("[red]Passwords do not match.[/red]")
-        raise typer.Exit(1)
-
-    engine = SyncEngine(server_url=server)
-    with console.status("[blue]Creating account...[/blue]", spinner="dots"):
-        result = engine.register(email, password)
-
-    cfg = load_config()
-    cfg["user_token"] = result["access_token"]
-    cfg["user_email"] = result["email"]
-    cfg["server_url"] = server
-    save_config(cfg)
-
-    console.print(
-        Panel(
-            "[bold]Email  [/bold]  " + result["email"] + "\n\n"
-            "You are now logged in.\n"
-            "Next: [cyan]study workspace create <name>[/cyan]",
-            title="[bold green]Account created[/bold green]",
-            border_style="green",
-            padding=(1, 2),
-        )
-    )
-
-
-@app.command()
-def login(
-    server: str = typer.Option(
-        DEFAULT_SERVER, "--server", "-s",
-        envvar="STUDYSYNC_SERVER", show_default=False,
-    ),
-) -> None:
-    """Login to your StudySync account."""
-    ensure_dirs()
-    console.rule("[bold blue]study login[/bold blue]", style="dim blue")
-    email = Prompt.ask("[cyan]Email[/cyan]")
-    password = Prompt.ask("[cyan]Password[/cyan]", password=True)
-
-    engine = SyncEngine(server_url=server)
-    with console.status("[blue]Logging in...[/blue]", spinner="dots"):
-        result = engine.login(email, password)
-
-    cfg = load_config()
-    cfg["user_token"] = result["access_token"]
-    cfg["user_email"] = result["email"]
-    cfg["server_url"] = server
-    save_config(cfg)
-
-    console.print(
-        Panel(
-            "Logged in as [bold]" + result["email"] + "[/bold]\n\n"
-            "Next: [cyan]study workspace create <name>[/cyan]  or  [cyan]study join <token>[/cyan]",
-            title="[bold green]Login successful[/bold green]",
-            border_style="green",
-            padding=(1, 2),
-        )
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -233,42 +156,10 @@ def workspace_create(
     )
 
 
-@workspace_app.command("remove")
-def workspace_remove(
-    email: str = typer.Argument(..., help="Email of the member to remove."),
-) -> None:
-    """Remove a member from your workspace. Owner only."""
-    console.rule("[bold blue]study workspace remove[/bold blue]", style="dim blue")
-    engine = SyncEngine()
-    with console.status("[blue]Removing " + email + "...[/blue]", spinner="dots"):
-        engine.remove_member(email)
-    console.print("[green]" + email + " removed from workspace.[/green]")
-
 
 # ---------------------------------------------------------------------------
 # Invite
 # ---------------------------------------------------------------------------
-
-@app.command()
-def invite(
-    email: str = typer.Argument(..., help="Email address of the friend to invite."),
-) -> None:
-    """Invite a friend to your current workspace by email."""
-    console.rule("[bold blue]study invite[/bold blue]", style="dim blue")
-    engine = SyncEngine()
-    with console.status("[blue]Inviting " + email + "...[/blue]", spinner="dots"):
-        result = engine.invite_member(email)
-    console.print(
-        Panel(
-            "[bold]" + email + "[/bold] has been added to [bold]" + result["workspace_name"] + "[/bold].\n\n"
-            "They can now run:\n"
-            "  [cyan]study join " + result["access_token"] + "[/cyan]\n"
-            "  [cyan]study pull[/cyan]",
-            title="[bold green]Invited[/bold green]",
-            border_style="green",
-            padding=(1, 2),
-        )
-    )
 
 
 # ---------------------------------------------------------------------------
